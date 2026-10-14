@@ -16,6 +16,7 @@ limitations under the License.
 
 Change history:
 
+1.3.2 - dsegall - updated websocket code for new okhttp version
 1.3.1 - dsegall - removed Sec-Websocket-Extensions header; generate random websocket key for each connection
 1.3.0 - dsegall - added support for detecting when a switch disconnects from MyLeviton
 1.2.0 - tomw + dsegall - Update device statuses from websocket events.  No more polling.
@@ -35,6 +36,8 @@ metadata
         capability "Refresh"
         
         attribute "commStatus", "enum", ["unknown", "good", "error"]
+        
+        command "removeChildDevice", [[name: "id", type:"STRING"]]
     }
 }
 
@@ -98,7 +101,9 @@ def refreshTokens()
     }
     
     // schedule next refresh, 1 hour before expiration
-    runIn(getTtl().toInteger() - 3600, refreshTokens)
+    int delay = getTtl().toInteger() - 3600
+    logDebug("refresh in ${delay}")
+    runIn(delay, refreshTokens)
 }
 
 def refreshSystemInfo()
@@ -160,13 +165,12 @@ def initialize()
         closeEventSocket()
         
         refreshTokens()
-        openEventSocket()
-        
-        refresh()
+        refresh()         // Populate state.switches FIRST
+        openEventSocket() // Then open the socket and subscribe
     }
     catch (Exception e)
     {
-        logDebug("initialize() failed")
+        logDebug("initialize() failed: ${e.message}")
         sendEvent(name: "commStatus", value: "error")
         
         reinitialize()
@@ -197,18 +201,13 @@ def openEventSocket()
 {
     try
     {
-        def headers = 
-        [
-            'Sec-WebSocket-Key': generateWebsocketKey(),
-            //'Sec-WebSocket-Extensions': 'permessage-deflate',
-            Origin: 'https://my.leviton.com',
-            Connection: 'keep-alive, Upgrade',
-            Pragma: 'no-cache',
-            'Cache-Control': 'no-cache',
-            Upgrade: 'websocket',
-        ]
-        
-        interfaces.webSocket.connect("wss://my.leviton.com/socket/websocket", headers: headers, origin: 'https://my.leviton.com')
+        // Let OkHttp generate Sec-WebSocket-Key, Upgrade, and Connection headers automatically.
+        // Explicitly set pingInterval (in seconds) to prevent idle NAT/load-balancer drops.
+        interfaces.webSocket.connect(
+            "wss://my.leviton.com/socket/websocket",
+            origin: "https://my.leviton.com",
+            pingInterval: 20
+        )
         
         sendEvent(name: "commStatus", value: "good")
     }
@@ -218,18 +217,6 @@ def openEventSocket()
         sendEvent(name: "commStatus", value: "error")        
         throw(e)
     }
-}
-
-String generateWebsocketKey() {
-    Random random = new Random()
-    StringBuilder sb = new StringBuilder()
-    for (int i = 0; i < 16; i++) {
-        sb.append((char)(random.nextInt(95) + 32))
-    }
-    
-    String base64 = sb.toString().bytes.encodeBase64().toString()
-    logDebug("websocket key is: ${base64}")
-    return base64
 }
 
 def closeEventSocket()
@@ -349,7 +336,7 @@ def parse(String message)
 
     catch (Exception e)
     {
-        // do something?
+        logDebug("parse() exception: ${e.message}")
     }
 }  
 
@@ -492,6 +479,12 @@ def findChildDevice(id)
 def createChildDevice(name, id)
 {
     return addChildDevice("My Leviton Switch/Dimmer", childDni(id), [label:"${childName(name)}", isComponent:false, name:"${childName(name)}"])
+}
+
+void removeChildDevice(id) {
+    String dni = childDni(id)
+    log.info "Removing device ${dni}"
+    deleteChildDevice(dni)
 }
 
 def manageChildDevice(name, id)
