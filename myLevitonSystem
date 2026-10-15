@@ -16,7 +16,6 @@ limitations under the License.
 
 Change history:
 
-1.3.2 - dsegall - updated websocket code for new okhttp version
 1.3.1 - dsegall - removed Sec-Websocket-Extensions header; generate random websocket key for each connection
 1.3.0 - dsegall - added support for detecting when a switch disconnects from MyLeviton
 1.2.0 - tomw + dsegall - Update device statuses from websocket events.  No more polling.
@@ -26,6 +25,9 @@ Change history:
 
 import java.util.ArrayList
 import java.util.Random
+import groovy.transform.Field
+
+@Field static Map<Long, Boolean> expectedCloseMap = new java.util.concurrent.ConcurrentHashMap<Long, Boolean>()
 
 metadata
 {
@@ -159,19 +161,21 @@ def refreshFromChild()
 
 def initialize()
 {
+    unschedule(initialize)
     sendEvent(name: "commStatus", value: "unknown")
     try
     {
         closeEventSocket()
         
         refreshTokens()
-        refresh()         // Populate state.switches FIRST
-        openEventSocket() // Then open the socket and subscribe
+        refreshSystemInfo() // Throws on failure so initialize() knows to retry
+        openEventSocket()
     }
     catch (Exception e)
     {
         logDebug("initialize() failed: ${e.message}")
         sendEvent(name: "commStatus", value: "error")
+        updateLabel()
         
         reinitialize()
     }
@@ -222,10 +226,11 @@ def openEventSocket()
 def closeEventSocket()
 {
     setWasExpectedClose(true)
-    // wait for state to catch up
-    pauseExecution(500)
-    
     interfaces.webSocket.close()
+    // Give the old socket 1 second to finish closing before opening a new one
+    pauseExecution(1000)
+    // Reset to false so it never stays stuck as true if refreshTokens() fails or the hub reboots
+    setWasExpectedClose(false)
 }
 
 def webSocketStatus(String message)
@@ -288,14 +293,15 @@ def updateLabel() {
 
 def reinitialize()
 {
-    // thanks @ogiewon for the example
+    unschedule(initialize)
     
-    // first delay is 2 seconds, doubles every time
-    def delayCalc = (state.reconnectDelay ?: 1) * 2    
+    // first delay is 5 seconds (gives Leviton's cloud load balancer time to recover), doubles every time
+    def delayCalc = (state.reconnectDelay ?: 2) * 2    
     // upper limit is 600s
     def reconnectDelay = delayCalc <= 600 ? delayCalc : 600
     
     state.reconnectDelay = reconnectDelay
+    logDebug("Reconnecting in ${reconnectDelay} seconds...")
     runIn(reconnectDelay, initialize)
 }
 
@@ -426,14 +432,16 @@ def getSwitches()
     return state.switches
 }
 
-def setWasExpectedClose(wasExpected)
+def setWasExpectedClose(Boolean wasExpected)
 {
+    expectedCloseMap[device.idAsLong] = wasExpected
     state.wasExpectedClose = wasExpected
 }
 
 def getWasExpectedClose()
 {
-    return state.wasExpectedClose
+    Boolean val = expectedCloseMap[device.idAsLong]
+    return (val != null) ? val : (state.wasExpectedClose ?: false)
 }
 
 def lev_login()
