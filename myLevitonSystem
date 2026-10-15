@@ -163,18 +163,47 @@ def refreshFromChild()
 def initialize()
 {
     unschedule(initialize)
+    unschedule(reconnectWebSocket)
     sendEvent(name: "commStatus", value: "unknown")
     try
     {
         closeEventSocket()
         
         refreshTokens()
-        refreshSystemInfo() // Throws on failure so initialize() knows to retry
+        refreshSystemInfo() // Populate state.switches and throw if HTTP fails
         openEventSocket()
     }
     catch (Exception e)
     {
         logDebug("initialize() failed: ${e.message}")
+        sendEvent(name: "commStatus", value: "error")
+        updateLabel()
+        
+        reinitialize()
+    }
+}
+
+def reconnectWebSocket()
+{
+    unschedule(reconnectWebSocket)
+    try
+    {
+        // If we don't have a valid login token or switch list yet, do a full initialize()
+        if (!getAuth() || !getLogin() || !getSwitches()) {
+            initialize()
+            return
+        }
+        
+        logDebug("Reconnecting WebSocket using existing auth token...")
+        closeEventSocket()
+        openEventSocket()
+        
+        // Refresh switch states in case anything changed while disconnected
+        refreshSystemInfo()
+    }
+    catch (Exception e)
+    {
+        logDebug("reconnectWebSocket() failed: ${e.message}")
         sendEvent(name: "commStatus", value: "error")
         updateLabel()
         
@@ -210,8 +239,7 @@ def openEventSocket()
         // Explicitly set pingInterval (in seconds) to prevent idle NAT/load-balancer drops.
         interfaces.webSocket.connect(
             "wss://my.leviton.com/socket/websocket",
-            origin: "https://my.leviton.com",
-            pingInterval: 20
+            origin: "https://my.leviton.com"
         )
         
         sendEvent(name: "commStatus", value: "good")
@@ -295,15 +323,15 @@ def updateLabel() {
 def reinitialize()
 {
     unschedule(initialize)
+    unschedule(reconnectWebSocket)
     
-    // first delay is 5 seconds (gives Leviton's cloud load balancer time to recover), doubles every time
-    def delayCalc = (state.reconnectDelay ?: 2) * 2    
-    // upper limit is 600s
+    // first delay is 2 seconds, doubles every time up to 600s
+    def delayCalc = (state.reconnectDelay ?: 1) * 2    
     def reconnectDelay = delayCalc <= 600 ? delayCalc : 600
     
     state.reconnectDelay = reconnectDelay
     logDebug("Reconnecting in ${reconnectDelay} seconds...")
-    runIn(reconnectDelay, initialize)
+    runIn(reconnectDelay, reconnectWebSocket)
 }
 
 def parse(String message)
@@ -531,6 +559,10 @@ def genParamsLogin()
     def params =
         [
             uri: getBaseURI() + "Person/login",
+            headers:
+            [
+                'Connection': 'close'
+            ],
             body:
             [
                 'email': username,
@@ -539,6 +571,7 @@ def genParamsLogin()
                 'rememberMe': true
             ],
             contentType: 'application/json',
+            timeout: 15
         ]
  
     return params
@@ -551,9 +584,11 @@ def genParamsMain(suffix, body = null)
             uri: getBaseURI() + suffix,
             headers:
             [
-                'Authorization': getAuth()
+                'Authorization': getAuth(),
+                'Connection': 'close'
             ],
             contentType: 'application/json',
+            timeout: 15
         ]
     
     if(body)
@@ -650,7 +685,9 @@ def httpExecWithAuthCheck(operation, params, throwToCaller = false)
     }
     catch (Exception e)
     {
-        if(e.getResponse().getStatus().toInteger() == 401)
+        // Safely check for 401 without throwing NullPointerException on non-HTTP exceptions (like JSON lexing errors)
+        def status = e.metaClass.respondsTo(e, "getResponse") ? e.getResponse()?.getStatus()?.toInteger() : null
+        if(status == 401)
         {
             // 401 Unauthorized
             try
