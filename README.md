@@ -12,7 +12,8 @@ https://github.com/tabrindle/homebridge-leviton/pull/9
 * In the *Drivers Code* section of Hubitat, add the myLevitonSystem and myLevitonSwitchDimmer drivers.
 * In the *Devices* section of Hubitat, add a *New Virtual Device* of type My Leviton System.
 * Open the configuration page for the newly created *Device* and enter your username and password for My Leviton and click *Save Preferences*.
-* Refresh the configuration page and look for child devices for any switches or dimmers that are configured in your system.
+* Refresh the configuration page, choose the residence in the **Residence** dropdown, and click *Save Preferences* again.
+* Child devices are created only for the switches and dimmers in the selected residence. Changing the selection removes child devices that belong to a different residence.
 
 # Usage instructions:
 
