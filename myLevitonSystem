@@ -53,6 +53,7 @@ preferences
         input "password", "password", title: "Password", required: true
         input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: false
         input name: "includeStatusInLabel", type: "bool", title: "Include status in device label", defaultValue: true
+        input name: "proxyHost", type: "text", title: "Debug Proxy Host:Port (optional, e.g. 192.168.1.50:8088)", required: false
     }
 }
 
@@ -110,29 +111,24 @@ def refreshTokens()
     runIn(delay, refreshTokens)
 }
 
-def refreshSystemInfo()
+def refreshSystemInfo(boolean markErrorOnFailure = true)
 {
     if (state.asyncQueue == null)
         state.asyncQueue = new ArrayList()
-    
+
     try
     {
-        // switches info
         setSwitches(lev_iot_switches())
-        
         def switchesInfo = getSwitches()        
         if(switchesInfo)
         {
             sendEvent(name: "commStatus", value: "good")
-            
-            def child
             for(thisSwitch in switchesInfo)
             {
                 logDebug("thisSwitch = ${thisSwitch}")
-                child = manageChildDevice(thisSwitch.name, thisSwitch.id)
+                def child = manageChildDevice(thisSwitch.name, thisSwitch.id)
                 if(child)
                 {
-                    // update child device
                     logDebug("updating child: ${thisSwitch.name} with power: ${thisSwitch.power} and brightness: ${thisSwitch.brightness}")
                     child.updateAttributes(thisSwitch.id, thisSwitch, false, true)
                 }
@@ -142,7 +138,9 @@ def refreshSystemInfo()
     catch (Exception e)
     {
         logDebug("refreshSystemInfo() failed: ${e.message}")
-        sendEvent(name: "commStatus", value: "error")
+        if (markErrorOnFailure) {
+            sendEvent(name: "commStatus", value: "error")
+        }
         throw(e)
     }
     finally {
@@ -189,26 +187,25 @@ def reconnectWebSocket()
     unschedule(reconnectWebSocket)
     try
     {
-        // If we don't have a valid login token or switch list yet, do a full initialize()
         if (!getAuth() || !getLogin() || !getSwitches()) {
             initialize()
             return
         }
-        
+
         logDebug("Reconnecting WebSocket using existing auth token...")
         closeEventSocket()
-        
-        // IMPORTANT: Run refreshSystemInfo() BEFORE openEventSocket()!
-        // Running it after openEventSocket() causes an 8-second thread overlap that overwrites state.reconnectDelay!
-        refreshSystemInfo()
+
+        boolean shouldMarkError = (getReconnectDelay() > 8)
+        refreshSystemInfo(shouldMarkError)
         openEventSocket()
     }
     catch (Exception e)
     {
         logDebug("reconnectWebSocket() failed: ${e.message}")
-        sendEvent(name: "commStatus", value: "error")
-        updateLabel()
-        
+        if (getReconnectDelay() > 8) {
+            sendEvent(name: "commStatus", value: "error")
+            updateLabel()
+        }
         reinitialize()
     }
 }
@@ -237,13 +234,12 @@ def openEventSocket()
 {
     try
     {
-        // Let OkHttp generate Sec-WebSocket-Key, Upgrade, and Connection headers automatically.
-        // Explicitly set pingInterval (in seconds) to prevent idle NAT/load-balancer drops.
+        def wsUrl = proxyHost ? "ws://${proxyHost}/socket/websocket" : "wss://my.leviton.com/socket/websocket"
         interfaces.webSocket.connect(
-            "wss://my.leviton.com/socket/websocket",
+            wsUrl,
             origin: "https://my.leviton.com"
         )
-        
+
         sendEvent(name: "commStatus", value: "good")
     }
     catch (Exception e)
@@ -273,7 +269,7 @@ def webSocketStatus(String message)
         {        
             sendEvent(name: "commStatus", value: "good")
         
-            setReconnectDelay(1)
+            setReconnectDelay(4)
             setWasExpectedClose(false)
         
             return
@@ -347,7 +343,7 @@ def setReconnectDelay(int delay)
 int getReconnectDelay()
 {
     Integer val = reconnectDelayMap[device.idAsLong]
-    return (val != null) ? val : (state.reconnectDelay ?: 1)
+    return (val != null) ? val : (state.reconnectDelay ?: 4)
 }
 
 def parse(String message)
@@ -521,7 +517,7 @@ def getUsername()
 
 def getBaseURI()
 {
-    return "https://my.leviton.com/api/"
+    return proxyHost ? "http://${proxyHost}/api/" : "https://my.leviton.com/api/"
 }
 
 def findChildDevice(id)
