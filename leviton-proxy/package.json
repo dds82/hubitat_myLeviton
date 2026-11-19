@@ -1,0 +1,9 @@
+{
+  "name": "leviton-hubitat-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "main": "proxy.js",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,14 @@
+services:
+  leviton-proxy:
+    build: .
+    container_name: leviton-proxy
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    environment:
+      - PORT=8088
+      - UPSTREAM_HOST=my.leviton.com
+      - LOG_DIR=/logs
+      - TZ=America/New_York
+    volumes:
+      - ./logs:/logs
