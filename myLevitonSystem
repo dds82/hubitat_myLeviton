@@ -16,6 +16,7 @@ limitations under the License.
 
 Change history:
 
+1.4.0 - dsegall - better failure detection
 1.3.2 - dsegall - updates for new okhttp library
 1.3.1 - dsegall - removed Sec-Websocket-Extensions header; generate random websocket key for each connection
 1.3.0 - dsegall - added support for detecting when a switch disconnects from MyLeviton
@@ -30,6 +31,7 @@ import groovy.transform.Field
 
 @Field static Map<Long, Boolean> expectedCloseMap = new java.util.concurrent.ConcurrentHashMap<Long, Boolean>()
 @Field static Map<Long, Integer> reconnectDelayMap = new java.util.concurrent.ConcurrentHashMap<Long, Integer>()
+@Field static Map<Long, Long> disconnectedSinceMap = new java.util.concurrent.ConcurrentHashMap<Long, Long>()
 
 metadata
 {
@@ -51,6 +53,7 @@ preferences
     {
         input "username", "text", title: "Username (email)", required: true
         input "password", "password", title: "Password", required: true
+        input name: "offlineTimeoutSeconds", type: "number", title: "Seconds disconnected before marking Offline", defaultValue: 60, range: "0..3600", required: true
         input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: false
         input name: "includeStatusInLabel", type: "bool", title: "Include status in device label", defaultValue: true
         input name: "proxyHost", type: "text", title: "Debug Proxy Host:Port (optional, e.g. 192.168.1.50:8088)", required: false
@@ -73,6 +76,7 @@ def updated()
 def configure()
 {
     state.clear()
+    clearDisconnectState()
     initialize()
 }
 
@@ -115,7 +119,7 @@ def refreshSystemInfo(boolean markErrorOnFailure = true)
 {
     if (state.asyncQueue == null)
         state.asyncQueue = new ArrayList()
-
+    
     try
     {
         setSwitches(lev_iot_switches())
@@ -123,10 +127,12 @@ def refreshSystemInfo(boolean markErrorOnFailure = true)
         if(switchesInfo)
         {
             sendEvent(name: "commStatus", value: "good")
+            
+            def child
             for(thisSwitch in switchesInfo)
             {
                 logDebug("thisSwitch = ${thisSwitch}")
-                def child = manageChildDevice(thisSwitch.name, thisSwitch.id)
+                child = manageChildDevice(thisSwitch.name, thisSwitch.id)
                 if(child)
                 {
                     logDebug("updating child: ${thisSwitch.name} with power: ${thisSwitch.power} and brightness: ${thisSwitch.brightness}")
@@ -169,15 +175,16 @@ def initialize()
         closeEventSocket()
         
         refreshTokens()
-        refreshSystemInfo() // Populate state.switches and throw if HTTP fails
+        refreshSystemInfo(false)
         openEventSocket()
     }
     catch (Exception e)
     {
         logDebug("initialize() failed: ${e.message}")
-        sendEvent(name: "commStatus", value: "error")
-        updateLabel()
-        
+        if (recordDisconnectAndCheckOffline()) {
+            sendEvent(name: "commStatus", value: "error")
+            updateLabel()
+        }
         reinitialize()
     }
 }
@@ -191,18 +198,17 @@ def reconnectWebSocket()
             initialize()
             return
         }
-
+        
         logDebug("Reconnecting WebSocket using existing auth token...")
         closeEventSocket()
-
-        boolean shouldMarkError = (getReconnectDelay() > 8)
-        refreshSystemInfo(shouldMarkError)
+        
+        refreshSystemInfo(false)
         openEventSocket()
     }
     catch (Exception e)
     {
         logDebug("reconnectWebSocket() failed: ${e.message}")
-        if (getReconnectDelay() > 8) {
+        if (recordDisconnectAndCheckOffline()) {
             sendEvent(name: "commStatus", value: "error")
             updateLabel()
         }
@@ -269,7 +275,8 @@ def webSocketStatus(String message)
         {        
             sendEvent(name: "commStatus", value: "good")
         
-            setReconnectDelay(4)
+            setReconnectDelay(1) // or your preferred baseline
+            clearDisconnectState()
             setWasExpectedClose(false)
         
             return
@@ -282,15 +289,16 @@ def webSocketStatus(String message)
                 return
             }
             
-            sendEvent(name: "commStatus", value: "no events")
+            if (recordDisconnectAndCheckOffline()) {
+                sendEvent(name: "commStatus", value: "error")
+            }
             reinitialize()
         
             return
         }
         else if(message.startsWith("failure:"))
         {
-            // Only mark commStatus as error if we've already failed at least one reconnect attempt (delay > 2)
-            if (getReconnectDelay() > 2) {
+            if (recordDisconnectAndCheckOffline()) {
                 sendEvent(name: "commStatus", value: "error")
             }
             reinitialize()
@@ -600,7 +608,7 @@ def genParamsMain(suffix, body = null)
                 'Connection': 'close'
             ],
             contentType: 'application/json',
-            timeout: 15
+            timeout: 25
         ]
     
     if(body)
@@ -730,5 +738,59 @@ def httpExecWithAuthCheck(operation, params, throwToCaller = false)
                 throw(e)
             }
         }
+    }
+}
+
+def setDisconnectedSince(long epochMs)
+{
+    disconnectedSinceMap[device.idAsLong] = epochMs
+    state.disconnectedSince = epochMs
+}
+
+long getDisconnectedSince()
+{
+    Long val = disconnectedSinceMap[device.idAsLong]
+    if (val != null) {
+        return val
+    }
+    return (state.disconnectedSince != null) ? (state.disconnectedSince as Long) : 0L
+}
+
+def clearDisconnectState()
+{
+    unschedule(markOfflineIfDisconnected)
+    setDisconnectedSince(0L)
+}
+
+boolean recordDisconnectAndCheckOffline()
+{
+    int timeoutSec = (offlineTimeoutSeconds != null) ? (offlineTimeoutSeconds as Integer) : 60
+    long since = getDisconnectedSince()
+    long currentMs = now()
+    
+    if (since == 0L)
+    {
+        setDisconnectedSince(currentMs)
+        if (timeoutSec <= 0)
+        {
+            return true
+        }
+        logDebug("Disconnect started; will mark Offline in ${timeoutSec}s if not restored")
+        runIn(timeoutSec, markOfflineIfDisconnected)
+        return false
+    }
+    
+    long elapsedSec = (long) ((currentMs - since) / 1000L)
+    logDebug("Still disconnected (${elapsedSec}s / ${timeoutSec}s)")
+    return elapsedSec >= timeoutSec
+}
+
+def markOfflineIfDisconnected()
+{
+    if (getDisconnectedSince() > 0L)
+    {
+        logDebug("Offline timeout reached; marking commStatus as error")
+        sendEvent(name: "commStatus", value: "error")
+        updateLabel()
     }
 }
